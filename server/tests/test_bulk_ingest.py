@@ -17,9 +17,12 @@ from graph_service.routers.ingest import (
 )
 
 
-def ingest_state(message: Message, *, completed: bool = True):
+def ingest_state(
+    message: Message, *, group_id: str = 'publisher-graph', completed: bool = True
+):
     return SimpleNamespace(
         uuid=message.uuid,
+        group_id=group_id,
         name=message.name,
         content=f'{message.role or ""}({message.role_type}): {message.content}',
         source_description=message.source_description,
@@ -357,6 +360,34 @@ async def test_durable_episode_identity_rejects_changed_semantic_payload() -> No
         request_id='changed-batch',
         group_id='publisher-graph',
         messages=[original.model_copy(update={'content': 'Changed'})],
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await add_messages_bulk(request, GraphitiStub())  # type: ignore[arg-type]
+
+    assert error.value.status_code == 409
+    assert error.value.detail['episode_uuids'] == ['episode-1']
+
+
+@pytest.mark.asyncio
+async def test_durable_episode_identity_rejects_cross_graph_uuid_reuse() -> None:
+    message = Message(
+        uuid='episode-1',
+        name='First',
+        role_type='system',
+        role='source',
+        content='Original',
+    )
+
+    class GraphitiStub:
+        async def find_episode_ingest_states(self, group_id, episode_uuids):
+            return [ingest_state(message, group_id='another-graph')]
+
+        async def add_episode_bulk(self, episodes, group_id):
+            raise AssertionError('cross-graph UUID reuse must not be processed')
+
+    request = AddMessagesBulkRequest(
+        request_id='cross-graph-batch', group_id='publisher-graph', messages=[message]
     )
 
     with pytest.raises(HTTPException) as error:

@@ -25,6 +25,7 @@ def _driver_for_group(driver: GraphDriver, group_id: str) -> GraphDriver:
 @dataclass(frozen=True)
 class EpisodeIngestState:
     uuid: str
+    group_id: str
     name: str
     content: str
     source_description: str
@@ -69,9 +70,9 @@ class ZepGraphiti(Graphiti):
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic)
-            WHERE e.group_id = $group_id
-              AND e.uuid IN $episode_uuids
+            WHERE e.uuid IN $episode_uuids
             RETURN e.uuid AS uuid,
+                   e.group_id AS group_id,
                    e.name AS name,
                    e.content AS content,
                    e.source_description AS source_description,
@@ -79,7 +80,6 @@ class ZepGraphiti(Graphiti):
                    e.valid_at AS valid_at,
                    coalesce(e.flint_ingest_completed, false) AS completed
             """,
-            group_id=group_id,
             episode_uuids=episode_uuids,
         )
         states = []

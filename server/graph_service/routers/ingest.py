@@ -63,9 +63,12 @@ def _episode_body(message: Message) -> str:
     return f'{message.role or ""}({message.role_type}): {message.content}'
 
 
-def _episode_matches_message(state: EpisodeIngestState, message: Message) -> bool:
+def _episode_matches_message(
+    state: EpisodeIngestState, message: Message, group_id: str
+) -> bool:
     return (
-        state.name == message.name
+        state.group_id == group_id
+        and state.name == message.name
         and state.content == _episode_body(message)
         and state.source_description == message.source_description
         and state.source == EpisodeType.message.value
@@ -122,7 +125,9 @@ async def _apply_messages_bulk(
         for message in request.messages:
             assert message.uuid is not None
             state = states.get(message.uuid)
-            if state is not None and not _episode_matches_message(state, message):
+            if state is not None and not _episode_matches_message(
+                state, message, request.group_id
+            ):
                 conflicting_uuids.append(message.uuid)
         if conflicting_uuids:
             raise HTTPException(

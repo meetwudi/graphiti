@@ -26,6 +26,7 @@ async def test_episode_ingest_state_uses_exact_episode_uuids_and_completion_mark
                 [
                     {
                         'uuid': 'episode-1',
+                        'group_id': 'another-graph',
                         'name': 'First',
                         'content': 'source(system): First',
                         'source_description': 'first source',
@@ -48,10 +49,9 @@ async def test_episode_ingest_state_uses_exact_episode_uuids_and_completion_mark
     )
 
     assert [state.uuid for state in states] == ['episode-1']
+    assert states[0].group_id == 'another-graph'
     assert states[0].completed is True
     assert 'e.uuid IN $episode_uuids' in driver.query
     assert 'source_description CONTAINS' not in driver.query
-    assert driver.parameters == {
-        'group_id': 'publisher-graph',
-        'episode_uuids': ['episode-1', 'episode-2'],
-    }
+    assert 'e.group_id = $group_id' not in driver.query
+    assert driver.parameters == {'episode_uuids': ['episode-1', 'episode-2']}
