@@ -6,7 +6,12 @@ from graph_service.dto.common import Message
 
 class AddMessagesBulkRequest(BaseModel):
     request_id: str = Field(..., min_length=1, description='Idempotency identity for this batch')
-    group_id: str = Field(..., description='The group id of the messages to add')
+    group_id: str = Field(
+        ...,
+        min_length=1,
+        pattern=r'^[a-zA-Z0-9_-]+$',
+        description='The graph identifier of the messages to add',
+    )
     messages: list[Message] = Field(
         ..., min_length=1, description='The messages to add in one bulk operation'
     )

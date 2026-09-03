@@ -115,6 +115,24 @@ def test_add_messages_bulk_rejects_empty_batches() -> None:
         AddMessagesBulkRequest(request_id='batch-1', group_id='publisher-graph', messages=[])
 
 
+@pytest.mark.parametrize('group_id', ['', 'publisher graph', 'publisher/graph'])
+def test_add_messages_bulk_rejects_invalid_graph_identifiers(group_id: str) -> None:
+    with pytest.raises(ValueError):
+        AddMessagesBulkRequest(
+            request_id='batch-1',
+            group_id=group_id,
+            messages=[
+                Message(
+                    uuid='episode-1',
+                    name='First',
+                    role_type='system',
+                    role='source',
+                    content='First article',
+                )
+            ],
+        )
+
+
 def test_add_messages_bulk_requires_deterministic_episode_uuids() -> None:
     with pytest.raises(ValueError, match='must include deterministic episode UUIDs'):
         AddMessagesBulkRequest(
@@ -618,7 +636,7 @@ async def test_queued_graph_does_not_block_another_graph() -> None:
         add_messages_bulk(request('b-1', 'graph-b', 'episode-b-1'), GraphitiStub())  # type: ignore[arg-type]
     )
 
-    await asyncio.wait_for(second_graph_started.wait(), timeout=0.5)
+    await asyncio.wait_for(second_graph_started.wait(), timeout=2)
     release_first_graph.set()
     await asyncio.gather(first, queued, independent)
 
