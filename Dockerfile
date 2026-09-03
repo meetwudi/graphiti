@@ -50,14 +50,17 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Create non-root user
 RUN groupadd -r app && useradd -r -d /app -g app app
 
-# Set up the server application first
+# Install the server against this vendored Graphiti core checkout.
 WORKDIR /app
-COPY ./server/pyproject.toml ./server/README.md ./server/uv.lock ./
-COPY ./server/graph_service ./graph_service
+COPY ./pyproject.toml ./README.md ./py.typed ./
+COPY ./graphiti_core ./graphiti_core
+COPY ./server/pyproject.toml ./server/README.md ./server/uv.lock ./server/
+COPY ./server/graph_service ./server/graph_service
+WORKDIR /app/server
 
-# Install server dependencies (without graphiti-core from lockfile)
-# Then install graphiti-core from PyPI at the desired version
-# This prevents the stale lockfile from pinning an old graphiti-core version
+# Install server dependencies. server/pyproject.toml resolves graphiti-core from
+# the parent checkout, so the running service and the reviewed vendored core are
+# the same code.
 # When socket_api_key is mounted (official releases), route through sfw;
 # otherwise install directly so public docker builds keep working.
 #
@@ -86,19 +89,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       echo "socket_api_key absent; installing without Socket Firewall"; \
       UV_CMD="uv"; \
     fi; \
-    $UV_CMD sync --frozen --no-dev; \
-    if [ -n "$GRAPHITI_VERSION" ]; then \
-        if [ "$INSTALL_FALKORDB" = "true" ]; then \
-            $UV_CMD pip install --upgrade "graphiti-core[falkordb]==$GRAPHITI_VERSION"; \
-        else \
-            $UV_CMD pip install --upgrade "graphiti-core==$GRAPHITI_VERSION"; \
-        fi; \
+    if [ "$INSTALL_FALKORDB" = "true" ]; then \
+        $UV_CMD sync --frozen --no-dev --extra falkordb --refresh-package graphiti-core; \
     else \
-        if [ "$INSTALL_FALKORDB" = "true" ]; then \
-            $UV_CMD pip install --upgrade "graphiti-core[falkordb]"; \
-        else \
-            $UV_CMD pip install --upgrade graphiti-core; \
-        fi; \
+        $UV_CMD sync --frozen --no-dev --refresh-package graphiti-core; \
     fi
 
 # Change ownership to app user
@@ -106,7 +100,7 @@ RUN chown -R app:app /app
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/server/.venv/bin:$PATH"
 
 # Switch to non-root user
 USER app
