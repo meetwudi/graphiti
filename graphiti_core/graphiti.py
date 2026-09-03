@@ -15,9 +15,10 @@ limitations under the License.
 """
 
 import logging
+from contextlib import suppress
 from datetime import datetime
 from time import time
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -1275,17 +1276,21 @@ class Graphiti:
         Notes
         -----
         This method performs several steps including:
-        - Saving all episodes to the database
         - Retrieving previous episode context for each new episode
         - Extracting nodes and edges from all episodes
         - Generating embeddings for nodes and edges
         - Deduplicating nodes and edges
-        - Saving nodes, episodic edges, and entity edges to the knowledge graph
+        - Saving episodes, nodes, episodic edges, and entity edges in the final write
 
         This bulk operation is designed for efficiency when processing multiple episodes
         at once. However, it's important to ensure that the bulk operation doesn't
         overwhelm system resources. Consider implementing rate limiting or chunking for
         very large batches of episodes.
+
+        Episodes are not persisted until semantic extraction and resolution complete.
+        A failure before the final write therefore leaves no raw episodic nodes that a
+        caller could mistake for successfully processed episodes. Atomicity of the final
+        write depends on the configured graph driver's transaction support.
 
         Edge invalidation and date extraction (``valid_at`` / ``invalid_at``) are
         performed in the bulk path as well: edges flow through ``extract_edges`` and
@@ -1316,31 +1321,28 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
-                episodes = [
-                    await EpisodicNode.get_by_uuid(self.driver, episode.uuid)
-                    if episode.uuid is not None
-                    else EpisodicNode(
-                        name=episode.name,
-                        labels=[],
-                        source=episode.source,
-                        content=episode.content,
-                        source_description=episode.source_description,
-                        group_id=group_id,
-                        created_at=now,
-                        valid_at=episode.reference_time,
+                episodes: list[EpisodicNode] = []
+                for raw_episode in bulk_episodes:
+                    episode = None
+                    if raw_episode.uuid is not None:
+                        with suppress(NodeNotFoundError):
+                            episode = await EpisodicNode.get_by_uuid(
+                                self.driver, raw_episode.uuid
+                            )
+                    episodes.append(
+                        episode
+                        or EpisodicNode(
+                            uuid=raw_episode.uuid,
+                            name=raw_episode.name,
+                            labels=[],
+                            source=raw_episode.source,
+                            content=raw_episode.content,
+                            source_description=raw_episode.source_description,
+                            group_id=group_id,
+                            created_at=now,
+                            valid_at=raw_episode.reference_time,
+                        )
                     )
-                    for episode in bulk_episodes
-                ]
-
-                # Save all episodes
-                await add_nodes_and_edges_bulk(
-                    driver=self.driver,
-                    episodic_nodes=episodes,
-                    episodic_edges=[],
-                    entity_nodes=[],
-                    entity_edges=[],
-                    embedder=self.embedder,
-                )
 
                 # Get previous episode context for each episode
                 episode_context = await retrieve_previous_episodes_bulk(self.driver, episodes)
@@ -1363,6 +1365,13 @@ class Graphiti:
                 episodic_edges: list[EpisodicEdge] = []
                 for episode_uuid, nodes in nodes_by_episode.items():
                     episodic_edges.extend(build_episodic_edges(nodes, episode_uuid, now))
+                for edge in episodic_edges:
+                    edge.uuid = str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f'graphiti-mentions\0{edge.source_node_uuid}\0{edge.target_node_uuid}',
+                        )
+                    )
 
                 # Re-map edge pointers and dedupe edges
                 extracted_edges_bulk_updated: list[list[EntityEdge]] = [
