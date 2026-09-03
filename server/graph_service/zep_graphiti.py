@@ -1,10 +1,14 @@
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import Depends, HTTPException
 from graphiti_core import Graphiti  # type: ignore
+from graphiti_core.driver.driver import GraphDriver, GraphProvider  # type: ignore
 from graphiti_core.edges import EntityEdge  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
+from graphiti_core.helpers import parse_db_date  # type: ignore
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 
@@ -12,6 +16,21 @@ from graph_service.config import ZepEnvDep
 from graph_service.dto import FactResult
 
 logger = logging.getLogger(__name__)
+
+
+def _driver_for_group(driver: GraphDriver, group_id: str) -> GraphDriver:
+    return driver.with_database(group_id) if driver.provider == GraphProvider.FALKORDB else driver
+
+
+@dataclass(frozen=True)
+class EpisodeIngestState:
+    uuid: str
+    name: str
+    content: str
+    source_description: str
+    source: str
+    valid_at: datetime
+    completed: bool
 
 
 class ZepGraphiti(Graphiti):
@@ -43,25 +62,71 @@ class ZepGraphiti(Graphiti):
         except EdgeNotFoundError as e:
             raise HTTPException(status_code=404, detail=e.message) from e
 
+    async def find_episode_ingest_states(
+        self, group_id: str, episode_uuids: list[str]
+    ) -> list[EpisodeIngestState]:
+        driver = _driver_for_group(self.driver, group_id)
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (e:Episodic)
+            WHERE e.group_id = $group_id
+              AND e.uuid IN $episode_uuids
+            RETURN e.uuid AS uuid,
+                   e.name AS name,
+                   e.content AS content,
+                   e.source_description AS source_description,
+                   e.source AS source,
+                   e.valid_at AS valid_at,
+                   coalesce(e.flint_ingest_completed, false) AS completed
+            """,
+            group_id=group_id,
+            episode_uuids=episode_uuids,
+        )
+        states = []
+        for record in records:
+            valid_at = parse_db_date(record['valid_at'])
+            if valid_at is None:
+                raise RuntimeError(f'episode {record["uuid"]} has no valid_at timestamp')
+            states.append(EpisodeIngestState(**{**record, 'valid_at': valid_at}))
+        return states
+
+    async def mark_episodes_completed(self, group_id: str, episode_uuids: list[str]) -> None:
+        driver = _driver_for_group(self.driver, group_id)
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (e:Episodic)
+            WHERE e.group_id = $group_id AND e.uuid IN $episode_uuids
+            SET e.flint_ingest_completed = true
+            RETURN count(e) AS completed_count
+            """,
+            group_id=group_id,
+            episode_uuids=episode_uuids,
+        )
+        completed_count = records[0]['completed_count'] if records else 0
+        if completed_count != len(episode_uuids):
+            raise RuntimeError(f'completed {completed_count} of {len(episode_uuids)} bulk episodes')
+
     async def delete_group(self, group_id: str):
+        driver = _driver_for_group(self.driver, group_id)
+
         try:
-            edges = await EntityEdge.get_by_group_ids(self.driver, [group_id])
+            edges = await EntityEdge.get_by_group_ids(driver, [group_id])
         except GroupsEdgesNotFoundError:
             logger.warning(f'No edges found for group {group_id}')
             edges = []
 
-        nodes = await EntityNode.get_by_group_ids(self.driver, [group_id])
+        nodes = await EntityNode.get_by_group_ids(driver, [group_id])
 
-        episodes = await EpisodicNode.get_by_group_ids(self.driver, [group_id])
+        episodes = await EpisodicNode.get_by_group_ids(driver, [group_id])
 
         for edge in edges:
-            await edge.delete(self.driver)
+            await edge.delete(driver)
 
         for node in nodes:
-            await node.delete(self.driver)
+            await node.delete(driver)
 
         for episode in episodes:
-            await episode.delete(self.driver)
+            await episode.delete(driver)
 
     async def delete_entity_edge(self, uuid: str):
         try:

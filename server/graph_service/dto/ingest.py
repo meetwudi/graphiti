@@ -1,15 +1,30 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from typing_extensions import Self
 
 from graph_service.dto.common import Message
 
 
-class AddMessagesRequest(BaseModel):
+class AddMessagesBulkRequest(BaseModel):
+    request_id: str = Field(..., min_length=1, description='Idempotency identity for this batch')
     group_id: str = Field(..., description='The group id of the messages to add')
-    messages: list[Message] = Field(..., description='The messages to add')
+    messages: list[Message] = Field(
+        ..., min_length=1, description='The messages to add in one bulk operation'
+    )
+
+    @model_validator(mode='after')
+    def require_unique_uuids(self) -> Self:
+        uuids = [message.uuid for message in self.messages]
+        if any(uuid is None for uuid in uuids):
+            raise ValueError('bulk messages must include deterministic episode UUIDs')
+        if len(set(uuids)) != len(uuids):
+            raise ValueError('bulk message episode UUIDs must be unique')
+        return self
 
 
-class AddEntityNodeRequest(BaseModel):
-    uuid: str = Field(..., description='The uuid of the node to add')
-    group_id: str = Field(..., description='The group id of the node to add')
-    name: str = Field(..., description='The name of the node to add')
-    summary: str = Field(default='', description='The summary of the node to add')
+class AddMessagesBulkResponse(BaseModel):
+    success: bool
+    request_id: str
+    message: str
+    episode_count: int
+    episode_uuids: list[str]
+    processed_episode_uuids: list[str]

@@ -4,8 +4,7 @@ Spawns the FastAPI server (``graph_service.main:app``) as a uvicorn subprocess
 backed by FalkorDB (the default test database) and a real OpenAI model, then
 exercises the public API end to end:
 
-    POST /messages (async ingest)
-        -> poll GET /episodes/{group_id} until the episode is persisted
+    POST /messages/bulk (synchronous ingest)
         -> POST /search and assert at least one fact was extracted
         -> DELETE /group/{group_id} to clean up.
 
@@ -149,37 +148,6 @@ def live_server() -> Iterator[tuple[str, str]]:
         log.close()
 
 
-def _wait_for_episodes(
-    client: httpx.Client,
-    group_id: str,
-    expected: int = 1,
-    timeout: float = 180.0,
-    poll: float = 3.0,
-) -> list:
-    """Poll GET /episodes until ``expected`` episodes are persisted.
-
-    /episodes is only called after /healthcheck has passed, so the server is
-    fully up: a 5xx here is a real error (e.g. a FalkorDB query failure) and is
-    surfaced immediately rather than masked as a slow generic timeout. Any other
-    non-200 is remembered and reported if the wait ultimately times out.
-    """
-    deadline = time.monotonic() + timeout
-    last_error: str | None = None
-    while time.monotonic() < deadline:
-        resp = client.get(f'/episodes/{group_id}', params={'last_n': 50})
-        if resp.status_code == 200:
-            episodes = resp.json()
-            if isinstance(episodes, list) and len(episodes) >= expected:
-                return episodes
-        elif resp.status_code >= 500:
-            raise AssertionError(f'/episodes returned {resp.status_code}: {resp.text[:500]}')
-        else:
-            last_error = f'{resp.status_code} {resp.text[:500]}'
-        time.sleep(poll)
-    detail = f'; last non-200 from /episodes: {last_error}' if last_error else ''
-    raise AssertionError(f'episode was not processed within {timeout:.0f}s{detail}')
-
-
 def _search_until(
     client: httpx.Client, group_id: str, query: str, attempts: int = 6, poll: float = 3.0
 ) -> list:
@@ -210,12 +178,15 @@ def test_ingest_search_delete_e2e(live_server: tuple[str, str]) -> None:
     with httpx.Client(base_url=base_url, timeout=30) as client:
         try:
             # 1. Ingest a message with clearly-extractable entities and a relationship.
+            episode_uuid = f'episode-{uuid.uuid4().hex}'
             add = client.post(
-                '/messages',
+                '/messages/bulk',
                 json={
+                    'request_id': f'request-{uuid.uuid4().hex}',
                     'group_id': group_id,
                     'messages': [
                         {
+                            'uuid': episode_uuid,
                             'content': (
                                 'Alice is a software engineer at Acme Corporation. '
                                 'She works on the Graphiti project.'
@@ -227,14 +198,12 @@ def test_ingest_search_delete_e2e(live_server: tuple[str, str]) -> None:
                     ],
                 },
             )
-            assert add.status_code == 202, f'add /messages failed: {add.status_code} {add.text}'
+            assert add.status_code == 201, (
+                f'add /messages/bulk failed: {add.status_code} {add.text}'
+            )
+            assert add.json()['episode_uuids'] == [episode_uuid]
 
-            # 2. Wait for the async worker to persist the episode (raises with
-            # detail on a server error or timeout).
-            episodes = _wait_for_episodes(client, group_id)
-            assert any(e.get('group_id') == group_id for e in episodes)
-
-            # 3. At least one fact (edge) was extracted and is searchable.
+            # 2. At least one fact (edge) was extracted and is searchable.
             facts = _search_until(client, group_id, 'Alice Acme Corporation Graphiti')
             assert facts, 'expected at least one extracted fact'
         finally:

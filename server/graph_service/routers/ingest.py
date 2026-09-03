@@ -1,111 +1,194 @@
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
+from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, FastAPI, status
+from fastapi import APIRouter, HTTPException, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
+from graphiti_core.utils.bulk_utils import RawEpisode  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 
-from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, Result
-from graph_service.zep_graphiti import ZepGraphitiDep
+from graph_service.dto import (
+    AddMessagesBulkRequest,
+    AddMessagesBulkResponse,
+    Message,
+    Result,
+)
+from graph_service.zep_graphiti import EpisodeIngestState, ZepGraphitiDep
+
+router = APIRouter()
 
 
-class AsyncWorker:
-    def __init__(self):
-        self.queue = asyncio.Queue()
-        self.task = None
-
-    async def worker(self):
-        while True:
-            try:
-                print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
-                job = await self.queue.get()
-                await job()
-            except asyncio.CancelledError:
-                break
-
-    async def start(self):
-        self.task = asyncio.create_task(self.worker())
-
-    async def stop(self):
-        if self.task:
-            self.task.cancel()
-            await self.task
-        while not self.queue.empty():
-            self.queue.get_nowait()
+@dataclass(frozen=True)
+class BulkRequestState:
+    payload_hash: str
+    task: asyncio.Task[AddMessagesBulkResponse]
 
 
-async_worker = AsyncWorker()
+_bulk_request_lock = asyncio.Lock()
+_bulk_requests: dict[str, BulkRequestState] = {}
+_bulk_group_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_bulk_clear_barrier = asyncio.Lock()
+
+
+def _evict_bulk_request(request_id: str, task: asyncio.Task[AddMessagesBulkResponse]) -> None:
+    state = _bulk_requests.get(request_id)
+    if state is not None and state.task is task:
+        _bulk_requests.pop(request_id, None)
+
+
+def _bulk_group_lock(group_id: str) -> asyncio.Lock:
+    lock = _bulk_group_locks.get(group_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _bulk_group_locks[group_id] = lock
+    return lock
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    await async_worker.start()
-    yield
-    await async_worker.stop()
+async def _locked_bulk_group(group_id: str):
+    async with _bulk_clear_barrier:
+        lock = _bulk_group_lock(group_id)
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
-router = APIRouter(lifespan=lifespan)
+def _episode_body(message: Message) -> str:
+    return f'{message.role or ""}({message.role_type}): {message.content}'
 
 
-@router.post('/messages', status_code=status.HTTP_202_ACCEPTED)
-async def add_messages(
-    request: AddMessagesRequest,
-    graphiti: ZepGraphitiDep,
-):
-    async def add_messages_task(m: Message):
-        await graphiti.add_episode(
-            uuid=m.uuid,
-            group_id=request.group_id,
-            name=m.name,
-            episode_body=f'{m.role or ""}({m.role_type}): {m.content}',
-            reference_time=m.timestamp,
-            source=EpisodeType.message,
-            source_description=m.source_description,
-        )
-
-    for m in request.messages:
-        await async_worker.queue.put(partial(add_messages_task, m))
-
-    return Result(message='Messages added to processing queue', success=True)
-
-
-@router.post('/entity-node', status_code=status.HTTP_201_CREATED)
-async def add_entity_node(
-    request: AddEntityNodeRequest,
-    graphiti: ZepGraphitiDep,
-):
-    node = await graphiti.save_entity_node(
-        uuid=request.uuid,
-        group_id=request.group_id,
-        name=request.name,
-        summary=request.summary,
+def _episode_matches_message(state: EpisodeIngestState, message: Message) -> bool:
+    return (
+        state.name == message.name
+        and state.content == _episode_body(message)
+        and state.source_description == message.source_description
+        and state.source == EpisodeType.message.value
+        and state.valid_at == message.timestamp
     )
-    return node
 
 
-@router.delete('/entity-edge/{uuid}', status_code=status.HTTP_200_OK)
-async def delete_entity_edge(uuid: str, graphiti: ZepGraphitiDep):
-    await graphiti.delete_entity_edge(uuid)
-    return Result(message='Entity Edge deleted', success=True)
+@router.post(
+    '/messages/bulk',
+    status_code=status.HTTP_201_CREATED,
+    response_model=AddMessagesBulkResponse,
+)
+async def add_messages_bulk(
+    request: AddMessagesBulkRequest,
+    graphiti: ZepGraphitiDep,
+) -> AddMessagesBulkResponse:
+    payload_hash = hashlib.sha256(
+        json.dumps(request.model_dump(mode='json'), sort_keys=True, separators=(',', ':')).encode()
+    ).hexdigest()
+    async with _bulk_request_lock:
+        existing = _bulk_requests.get(request.request_id)
+        if existing is not None and existing.payload_hash != payload_hash:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='request_id was already used for a different bulk payload',
+            )
+        if existing is None:
+            task = asyncio.create_task(_apply_messages_bulk(request, graphiti))
+            existing = BulkRequestState(payload_hash=payload_hash, task=task)
+            _bulk_requests[request.request_id] = existing
+            task.add_done_callback(partial(_evict_bulk_request, request.request_id))
+    try:
+        return await asyncio.shield(existing.task)
+    except asyncio.CancelledError:
+        # Keep the request-scoped Graphiti client alive until the shared task
+        # finishes; a retry with the same request_id will join this task.
+        await existing.task
+        raise
+
+
+async def _apply_messages_bulk(
+    request: AddMessagesBulkRequest,
+    graphiti: ZepGraphitiDep,
+) -> AddMessagesBulkResponse:
+    requested_uuids = [message.uuid for message in request.messages if message.uuid is not None]
+    async with _locked_bulk_group(request.group_id):
+        states = {
+            state.uuid: state
+            for state in await graphiti.find_episode_ingest_states(
+                request.group_id, requested_uuids
+            )
+        }
+        conflicting_uuids: list[str] = []
+        for message in request.messages:
+            assert message.uuid is not None
+            state = states.get(message.uuid)
+            if state is not None and not _episode_matches_message(state, message):
+                conflicting_uuids.append(message.uuid)
+        if conflicting_uuids:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'message': 'episode UUID was already used for a different semantic payload',
+                    'episode_uuids': conflicting_uuids,
+                },
+            )
+        completed_uuids = {uuid for uuid, state in states.items() if state.completed}
+        missing_messages = [
+            message for message in request.messages if message.uuid not in completed_uuids
+        ]
+        if missing_messages:
+            result = await graphiti.add_episode_bulk(
+                [
+                    RawEpisode(
+                        uuid=message.uuid,
+                        name=message.name,
+                        content=_episode_body(message),
+                        reference_time=message.timestamp,
+                        source=EpisodeType.message,
+                        source_description=message.source_description,
+                    )
+                    for message in missing_messages
+                ],
+                group_id=request.group_id,
+            )
+            written_uuids = [episode.uuid for episode in result.episodes]
+            expected_uuids = [
+                message.uuid for message in missing_messages if message.uuid is not None
+            ]
+            if sorted(written_uuids) != sorted(expected_uuids):
+                raise RuntimeError('Graphiti bulk write returned unexpected episode identities')
+            await graphiti.mark_episodes_completed(request.group_id, written_uuids)
+    return AddMessagesBulkResponse(
+        success=True,
+        request_id=request.request_id,
+        message='Messages added in bulk',
+        episode_count=len(requested_uuids),
+        episode_uuids=requested_uuids,
+        processed_episode_uuids=[
+            message.uuid for message in missing_messages if message.uuid is not None
+        ],
+    )
 
 
 @router.delete('/group/{group_id}', status_code=status.HTTP_200_OK)
 async def delete_group(group_id: str, graphiti: ZepGraphitiDep):
-    await graphiti.delete_group(group_id)
+    async with _locked_bulk_group(group_id):
+        await graphiti.delete_group(group_id)
     return Result(message='Group deleted', success=True)
-
-
-@router.delete('/episode/{uuid}', status_code=status.HTTP_200_OK)
-async def delete_episode(uuid: str, graphiti: ZepGraphitiDep):
-    await graphiti.delete_episodic_node(uuid)
-    return Result(message='Episode deleted', success=True)
 
 
 @router.post('/clear', status_code=status.HTTP_200_OK)
 async def clear(
     graphiti: ZepGraphitiDep,
 ):
-    await clear_data(graphiti.driver)
-    await graphiti.build_indices_and_constraints()
+    async with _bulk_clear_barrier:
+        locks = list(_bulk_group_locks.values())
+        for lock in locks:
+            await lock.acquire()
+        try:
+            await clear_data(graphiti.driver)
+            await graphiti.build_indices_and_constraints()
+        finally:
+            for lock in reversed(locks):
+                lock.release()
     return Result(message='Graph cleared', success=True)
