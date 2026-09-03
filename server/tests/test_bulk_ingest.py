@@ -9,6 +9,7 @@ from graphiti_core.nodes import EpisodeType
 import graph_service.routers.ingest as ingest_router
 from graph_service.dto import AddMessagesBulkRequest, Message
 from graph_service.routers.ingest import (
+    _bulk_episode_locks,
     _bulk_group_locks,
     _bulk_requests,
     add_messages_bulk,
@@ -50,6 +51,7 @@ def test_only_change_set_and_graph_level_mutations_are_exposed() -> None:
 def clear_bulk_request_registry() -> None:
     _bulk_requests.clear()
     _bulk_group_locks.clear()
+    _bulk_episode_locks.clear()
 
 
 @pytest.mark.asyncio
@@ -670,6 +672,63 @@ async def test_queued_graph_does_not_block_another_graph() -> None:
     await asyncio.wait_for(second_graph_started.wait(), timeout=2)
     release_first_graph.set()
     await asyncio.gather(first, queued, independent)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_graphs_cannot_process_the_same_episode_uuid() -> None:
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    completed_group: str | None = None
+    add_count = 0
+
+    class GraphitiStub:
+        async def find_episode_ingest_states(self, group_id, episode_uuids):
+            if completed_group is None:
+                return []
+            return [ingest_state(message(), group_id=completed_group)]
+
+        async def add_episode_bulk(self, episodes, group_id):
+            nonlocal add_count
+            add_count += 1
+            first_write_started.set()
+            await release_first_write.wait()
+            return SimpleNamespace(episodes=[SimpleNamespace(uuid='shared-episode')])
+
+        async def mark_episodes_completed(self, group_id, episode_uuids):
+            nonlocal completed_group
+            completed_group = group_id
+
+    def message():
+        return Message(
+            uuid='shared-episode',
+            name='Shared',
+            role_type='system',
+            role='source',
+            content='Shared',
+        )
+
+    graphiti = GraphitiStub()
+    first_request = AddMessagesBulkRequest(
+        request_id='graph-a-batch', group_id='graph-a', messages=[message()]
+    )
+    second_request = AddMessagesBulkRequest(
+        request_id='graph-b-batch', group_id='graph-b', messages=[message()]
+    )
+
+    first = asyncio.create_task(add_messages_bulk(first_request, graphiti))  # type: ignore[arg-type]
+    await first_write_started.wait()
+    second = asyncio.create_task(add_messages_bulk(second_request, graphiti))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    assert add_count == 1
+
+    release_first_write.set()
+    await first
+    with pytest.raises(HTTPException) as error:
+        await second
+
+    assert error.value.status_code == 409
+    assert error.value.detail['episode_uuids'] == ['shared-episode']
+    assert add_count == 1
 
 
 @pytest.mark.asyncio

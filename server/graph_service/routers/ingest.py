@@ -31,6 +31,7 @@ class BulkRequestState:
 _bulk_request_lock = asyncio.Lock()
 _bulk_requests: dict[str, BulkRequestState] = {}
 _bulk_group_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_bulk_episode_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 _bulk_clear_barrier = asyncio.Lock()
 
 
@@ -48,15 +49,30 @@ def _bulk_group_lock(group_id: str) -> asyncio.Lock:
     return lock
 
 
+def _bulk_episode_lock(episode_uuid: str) -> asyncio.Lock:
+    lock = _bulk_episode_locks.get(episode_uuid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _bulk_episode_locks[episode_uuid] = lock
+    return lock
+
+
 @asynccontextmanager
-async def _locked_bulk_group(group_id: str):
+async def _locked_bulk_group(group_id: str, episode_uuids: list[str]):
     async with _bulk_clear_barrier:
-        lock = _bulk_group_lock(group_id)
-    await lock.acquire()
+        group_lock = _bulk_group_lock(group_id)
+        episode_locks = [_bulk_episode_lock(uuid) for uuid in sorted(set(episode_uuids))]
+    acquired: list[asyncio.Lock] = []
     try:
+        await group_lock.acquire()
+        acquired.append(group_lock)
+        for lock in episode_locks:
+            await lock.acquire()
+            acquired.append(lock)
         yield
     finally:
-        lock.release()
+        for lock in reversed(acquired):
+            lock.release()
 
 
 def _episode_body(message: Message) -> str:
@@ -114,7 +130,7 @@ async def _apply_messages_bulk(
     graphiti: ZepGraphitiDep,
 ) -> AddMessagesBulkResponse:
     requested_uuids = [message.uuid for message in request.messages if message.uuid is not None]
-    async with _locked_bulk_group(request.group_id):
+    async with _locked_bulk_group(request.group_id, requested_uuids):
         states = {
             state.uuid: state
             for state in await graphiti.find_episode_ingest_states(
@@ -177,7 +193,7 @@ async def _apply_messages_bulk(
 
 @router.delete('/group/{group_id}', status_code=status.HTTP_200_OK)
 async def delete_group(group_id: str, graphiti: ZepGraphitiDep):
-    async with _locked_bulk_group(group_id):
+    async with _locked_bulk_group(group_id, []):
         await graphiti.delete_group(group_id)
     return Result(message='Group deleted', success=True)
 
