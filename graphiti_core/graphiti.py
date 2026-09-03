@@ -104,6 +104,11 @@ from graphiti_core.utils.maintenance.node_operations import (
     resolve_extracted_nodes,
 )
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
+from graphiti_core.utils.ontology_utils.strict_ontology import (
+    validate_nodes_against_ontology,
+    validate_semantic_data_against_ontology,
+    validate_strict_ontology_configuration,
+)
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
 logger = logging.getLogger(__name__)
@@ -636,9 +641,11 @@ class Graphiti:
         edge_type_map: dict[tuple[str, str], list[str]],
         group_id: str,
         edge_types: dict[str, type[BaseModel]] | None,
+        entity_types: dict[str, type[BaseModel]] | None,
         nodes: list[EntityNode],
         uuid_map: dict[str, str],
         custom_extraction_instructions: str | None = None,
+        strict_ontology: bool = False,
     ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
         """Extract edges from episode(s) and resolve against existing graph.
 
@@ -662,7 +669,17 @@ class Graphiti:
             group_id,
             edge_types,
             custom_extraction_instructions,
+            strict_ontology,
         )
+
+        if strict_ontology:
+            validate_semantic_data_against_ontology(
+                extracted_nodes,
+                extracted_edges,
+                entity_types or {},
+                edge_types or {},
+                edge_type_map,
+            )
 
         edges = resolve_edge_pointers(extracted_edges, uuid_map)
 
@@ -676,6 +693,37 @@ class Graphiti:
         )
 
         return resolved_edges, invalidated_edges, new_edges
+
+    async def _validate_semantic_write_set(
+        self,
+        nodes: list[EntityNode],
+        edges: list[EntityEdge],
+        group_id: str,
+        entity_types: dict[str, type[BaseModel]],
+        edge_types: dict[str, type[BaseModel]],
+        edge_type_map: dict[tuple[str, str], list[str]],
+    ) -> None:
+        """Validate every entity and edge that a strict ingestion call will persist."""
+        nodes_by_uuid = {node.uuid: node for node in nodes}
+        referenced_uuids = {
+            node_uuid
+            for edge in edges
+            for node_uuid in (edge.source_node_uuid, edge.target_node_uuid)
+        }
+        missing_uuids = referenced_uuids - nodes_by_uuid.keys()
+        if missing_uuids:
+            existing_nodes = await EntityNode.get_by_uuids(
+                self.driver, list(missing_uuids), group_id=group_id
+            )
+            nodes_by_uuid.update({node.uuid: node for node in existing_nodes})
+
+        validate_semantic_data_against_ontology(
+            list(nodes_by_uuid.values()),
+            edges,
+            entity_types,
+            edge_types,
+            edge_type_map,
+        )
 
     async def _process_episode_data(
         self,
@@ -788,6 +836,7 @@ class Graphiti:
         entity_types: dict[str, type[BaseModel]] | None,
         excluded_entity_types: list[str] | None,
         custom_extraction_instructions: str | None = None,
+        strict_ontology: bool = False,
     ) -> tuple[
         dict[str, list[EntityNode]],
         dict[str, str],
@@ -803,11 +852,16 @@ class Graphiti:
             entity_types=entity_types,
             excluded_entity_types=excluded_entity_types,
             custom_extraction_instructions=custom_extraction_instructions,
+            strict_ontology=strict_ontology,
         )
 
         # Dedupe extracted nodes in memory
         nodes_by_episode, uuid_map = await dedupe_nodes_bulk(
-            self.clients, extracted_nodes_bulk, episode_context, entity_types
+            self.clients,
+            extracted_nodes_bulk,
+            episode_context,
+            entity_types,
+            strict_ontology=strict_ontology,
         )
 
         return nodes_by_episode, uuid_map, extracted_edges_bulk
@@ -821,6 +875,7 @@ class Graphiti:
         edge_types: dict[str, type[BaseModel]] | None,
         edge_type_map: dict[tuple[str, str], list[str]],
         episodes: list[EpisodicNode],
+        strict_ontology: bool = False,
     ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
         """Resolve nodes and edges against the existing graph."""
         nodes_by_uuid: dict[str, EntityNode] = {
@@ -847,6 +902,7 @@ class Graphiti:
                     episode,
                     previous_episodes,
                     entity_types,
+                    strict_ontology=strict_ontology,
                 )
                 for episode, previous_episodes in episode_context
             ]
@@ -995,6 +1051,7 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        strict_ontology: bool = False,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -1042,6 +1099,10 @@ class Graphiti:
             query to find the most recent episode. Useful for efficiently adding multiple episodes
             to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
             as this parameter for the next episode.
+        strict_ontology : bool
+            Optional. When true, require an explicit ontology, restrict entity resolution to nodes
+            with matching types, and reject extracted or resolved relationships that violate the
+            declared source/target signatures. Defaults to false.
 
         Returns
         -------
@@ -1052,6 +1113,9 @@ class Graphiti:
         This method performs several steps including node extraction, edge extraction,
         deduplication, and database updates. It also handles embedding generation
         and edge invalidation.
+
+        In strict ontology mode, validation completes before persistence. An ontology validation
+        failure therefore writes neither the episode nor any derived semantic data.
 
         It is recommended to run this method as a background process, such as in a queue.
         It's important that each episode is added sequentially and awaited before adding
@@ -1069,6 +1133,8 @@ class Graphiti:
 
         validate_entity_types(entity_types)
         validate_excluded_entity_types(excluded_entity_types, entity_types)
+        if strict_ontology:
+            validate_strict_ontology_configuration(entity_types, edge_types, edge_type_map)
 
         if group_id is None:
             # if group_id is None, use the default group id by the provider
@@ -1126,7 +1192,11 @@ class Graphiti:
                     entity_types,
                     excluded_entity_types,
                     custom_extraction_instructions,
+                    strict_ontology,
                 )
+
+                if strict_ontology:
+                    validate_nodes_against_ontology(extracted_nodes, entity_types or {})
 
                 nodes, uuid_map, _ = await resolve_extracted_nodes(
                     self.clients,
@@ -1134,6 +1204,7 @@ class Graphiti:
                     episode,
                     previous_episodes,
                     entity_types,
+                    strict_ontology=strict_ontology,
                 )
 
                 # Extract and resolve edges in parallel with attribute extraction
@@ -1148,9 +1219,11 @@ class Graphiti:
                     edge_type_map or edge_type_map_default,
                     group_id,
                     edge_types,
+                    entity_types,
                     nodes,
                     uuid_map,
                     custom_extraction_instructions,
+                    strict_ontology,
                 )
 
                 entity_edges = resolved_edges + invalidated_edges
@@ -1165,6 +1238,16 @@ class Graphiti:
                     entity_types,
                     edges=new_edges,
                 )
+
+                if strict_ontology:
+                    await self._validate_semantic_write_set(
+                        hydrated_nodes,
+                        entity_edges,
+                        group_id,
+                        entity_types or {},
+                        edge_types or {},
+                        edge_type_map or {},
+                    )
 
                 # Process and save episode data (including saga association if provided)
                 episodic_edges, episode = await self._process_episode_data(
@@ -1237,6 +1320,7 @@ class Graphiti:
         edge_type_map: dict[tuple[str, str], list[str]] | None = None,
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
+        strict_ontology: bool = False,
     ) -> AddBulkEpisodeResults:
         """
         Process multiple episodes in bulk and update the graph.
@@ -1267,6 +1351,10 @@ class Graphiti:
             If a string is provided and a saga with this name already exists in the group, the episodes
             will be added to it. Otherwise, a new saga will be created. Sagas are connected to episodes
             via HAS_EPISODE edges, and consecutive episodes are linked via NEXT_EPISODE edges.
+        strict_ontology : bool
+            Optional. When true, require an explicit ontology, restrict entity resolution to nodes
+            with matching types, and reject the entire batch if any extracted or resolved
+            relationship violates its declared source/target signature. Defaults to false.
 
         Returns
         -------
@@ -1291,6 +1379,11 @@ class Graphiti:
         performed in the bulk path as well: edges flow through ``extract_edges`` and
         ``resolve_extracted_edges`` just like in ``add_episode``, and any invalidated
         edges are persisted alongside the newly resolved ones.
+
+        Bulk episodes are registered before extraction. In strict ontology mode, a validation
+        failure can therefore leave those episode nodes registered, but no entity nodes, entity
+        edges, or episodic edges from the batch are written. Semantic writes are all-or-nothing
+        with respect to ontology validation, independent of the configured graph provider.
         """
         with self.tracer.start_span('add_episode_bulk') as bulk_span:
             bulk_span.add_attributes({'episode.count': len(bulk_episodes)})
@@ -1298,6 +1391,11 @@ class Graphiti:
             try:
                 start = time()
                 now = utc_now()
+
+                if strict_ontology:
+                    validate_entity_types(entity_types)
+                    validate_excluded_entity_types(excluded_entity_types, entity_types)
+                    validate_strict_ontology_configuration(entity_types, edge_types, edge_type_map)
 
                 # if group_id is None, use the default group id by the provider
                 if group_id is None:
@@ -1357,6 +1455,7 @@ class Graphiti:
                     entity_types,
                     excluded_entity_types,
                     custom_extraction_instructions,
+                    strict_ontology,
                 )
 
                 # Create Episodic Edges
@@ -1392,7 +1491,18 @@ class Graphiti:
                     edge_types,
                     edge_type_map or edge_type_map_default,
                     episodes,
+                    strict_ontology,
                 )
+
+                if strict_ontology:
+                    await self._validate_semantic_write_set(
+                        final_hydrated_nodes,
+                        resolved_edges + invalidated_edges,
+                        group_id,
+                        entity_types or {},
+                        edge_types or {},
+                        edge_type_map or {},
+                    )
 
                 # Resolved pointers for episodic edges
                 resolved_episodic_edges = resolve_edge_pointers(episodic_edges, final_uuid_map)

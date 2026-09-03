@@ -21,6 +21,7 @@ from time import time
 from pydantic import BaseModel
 
 from graphiti_core.edges import EntityEdge
+from graphiti_core.errors import OntologyValidationError
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.nodes import EntityNode, EpisodicNode
@@ -47,6 +48,7 @@ async def extract_nodes_and_edges(
     edge_type_map: dict[tuple[str, str], list[str]] | None = None,
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
+    strict_ontology: bool = False,
 ) -> tuple[list[EntityNode], list[EntityEdge], dict[str, list[int]]]:
     """Extract entity nodes and relationship facts in a single LLM call.
 
@@ -122,6 +124,7 @@ async def extract_nodes_and_edges(
         'custom_extraction_instructions': custom_extraction_instructions or '',
         'entity_types': entity_types_context,
         'edge_types': edge_types_context,
+        'strict_ontology': strict_ontology,
     }
 
     # Single LLM call for combined extraction
@@ -172,7 +175,7 @@ async def extract_nodes_and_edges(
     # Temporarily use an empty map — real attribution comes from edges below.
     node_episode_index_map: dict[str, list[int]] = {}
     extracted_nodes = _collapse_exact_duplicate_extracted_nodes(
-        extracted_nodes, node_episode_index_map
+        extracted_nodes, node_episode_index_map, strict_ontology
     )
 
     # --- Process edges ---
@@ -189,11 +192,21 @@ async def extract_nodes_and_edges(
         target_node = name_to_node.get(_normalize_string_exact(edge_data.target_entity_name))
 
         if source_node is None:
+            if strict_ontology:
+                raise OntologyValidationError(
+                    f'Source entity "{edge_data.source_entity_name}" not found in nodes for '
+                    f'edge relation: {edge_data.relation_type}'
+                )
             logger.debug(
                 f'Skipping edge: source "{edge_data.source_entity_name}" not in extracted nodes'
             )
             continue
         if target_node is None:
+            if strict_ontology:
+                raise OntologyValidationError(
+                    f'Target entity "{edge_data.target_entity_name}" not found in nodes for '
+                    f'edge relation: {edge_data.relation_type}'
+                )
             logger.debug(
                 f'Skipping edge: target "{edge_data.target_entity_name}" not in extracted nodes'
             )

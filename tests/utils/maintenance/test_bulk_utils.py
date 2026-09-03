@@ -59,6 +59,7 @@ async def test_dedupe_nodes_bulk_reuses_canonical_nodes(monkeypatch):
         previous_episodes_arg,
         entity_types_arg,
         existing_nodes_override=None,
+        strict_ontology=False,
     ):
         call_queue.append(existing_nodes_override)
 
@@ -146,6 +147,7 @@ async def test_dedupe_nodes_bulk_uuid_map_respects_direction(monkeypatch):
         previous_episodes_arg,
         entity_types_arg,
         existing_nodes_override=None,
+        strict_ontology=False,
     ):
         if nodes_arg == [extracted_one]:
             return [canonical], {canonical.uuid: canonical.uuid}, []
@@ -163,6 +165,53 @@ async def test_dedupe_nodes_bulk_uuid_map_respects_direction(monkeypatch):
     assert nodes_by_episode[episode_one.uuid] == [canonical]
     assert nodes_by_episode[episode_two.uuid] == [canonical]
     assert compressed_map.get(alias.uuid) == canonical.uuid
+
+
+@pytest.mark.asyncio
+async def test_strict_dedupe_nodes_bulk_preserves_cross_type_names_and_coalesces_same_type(
+    monkeypatch,
+):
+    clients = _make_clients()
+    episodes = [_make_episode(str(index)) for index in range(3)]
+    company = EntityNode(
+        uuid='company-canonical', name='Acme', group_id='group', labels=['Entity', 'Company']
+    )
+    product = EntityNode(
+        uuid='product-canonical', name='Acme', group_id='group', labels=['Entity', 'Product']
+    )
+    company_duplicate = EntityNode(
+        uuid='company-duplicate', name='Acme', group_id='group', labels=['Entity', 'Company']
+    )
+
+    async def keep_first_pass_identity(
+        _clients,
+        nodes,
+        _episode,
+        _previous_episodes,
+        _entity_types,
+        existing_nodes_override=None,
+        strict_ontology=False,
+    ):
+        assert existing_nodes_override is None
+        assert strict_ontology is True
+        node = nodes[0]
+        return [node], {node.uuid: node.uuid}, []
+
+    monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', keep_first_pass_identity)
+
+    nodes_by_episode, uuid_map = await bulk_utils.dedupe_nodes_bulk(
+        clients,
+        [[company], [product], [company_duplicate]],
+        [(episode, []) for episode in episodes],
+        strict_ontology=True,
+    )
+
+    assert nodes_by_episode[episodes[0].uuid] == [company]
+    assert nodes_by_episode[episodes[1].uuid] == [product]
+    assert nodes_by_episode[episodes[2].uuid] == [company]
+    assert uuid_map[company.uuid] == company.uuid
+    assert uuid_map[product.uuid] == product.uuid
+    assert uuid_map[company_duplicate.uuid] == company.uuid
 
 
 @pytest.mark.asyncio
@@ -347,6 +396,7 @@ async def test_extract_nodes_and_edges_bulk_passes_custom_instructions_to_extrac
         entity_types=None,
         excluded_entity_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         extract_nodes_calls.append(
             {
@@ -366,6 +416,7 @@ async def test_extract_nodes_and_edges_bulk_passes_custom_instructions_to_extrac
         group_id='',
         edge_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         return []
 
@@ -404,6 +455,7 @@ async def test_extract_nodes_and_edges_bulk_passes_custom_instructions_to_extrac
         entity_types=None,
         excluded_entity_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         return [extracted_node], {}
 
@@ -416,6 +468,7 @@ async def test_extract_nodes_and_edges_bulk_passes_custom_instructions_to_extrac
         group_id='',
         edge_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         extract_edges_calls.append(
             {
@@ -460,6 +513,7 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_none_by_default(
         entity_types=None,
         excluded_entity_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         extract_nodes_calls.append(
             {'custom_extraction_instructions': custom_extraction_instructions}
@@ -475,6 +529,7 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_none_by_default(
         group_id='',
         edge_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         extract_edges_calls.append(
             {'custom_extraction_instructions': custom_extraction_instructions}
@@ -515,6 +570,7 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_multiple_episode
         entity_types=None,
         excluded_entity_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         extract_nodes_calls.append(
             {
@@ -533,6 +589,7 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_multiple_episode
         group_id='',
         edge_types=None,
         custom_extraction_instructions=None,
+        strict_ontology=False,
     ):
         extract_edges_calls.append(
             {

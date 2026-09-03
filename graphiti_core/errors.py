@@ -75,6 +75,14 @@ class EntityTypeValidationError(GraphitiError):
         super().__init__(self.message)
 
 
+class OntologyValidationError(GraphitiError, ValueError):
+    """Raised when strict ontology validation rejects extracted graph data."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
+
+
 class GroupIdValidationError(GraphitiError):
     """Raised when a group_id contains invalid characters."""
 

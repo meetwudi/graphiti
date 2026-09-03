@@ -99,6 +99,18 @@ def edge(context: dict[str, Any]) -> list[Message]:
 {to_prompt_json(context['edge_types'])}
 </FACT_TYPES>
 """
+    relation_type_rules = (
+        '- FACT_TYPES are exhaustive. Emit an edge only when a declared fact_type_name matches '
+        'the source and target entity type signature.\n'
+        '- If no declared FACT_TYPE and signature match, omit the edge. Never invent a '
+        'relation_type.'
+        if context.get('strict_ontology')
+        else '- If FACT_TYPES are provided and the relationship matches one of the types '
+        '(considering the entity type signature), use that fact_type_name as the '
+        '`relation_type`.\n'
+        '- Otherwise, derive a `relation_type` from the relationship predicate in '
+        'SCREAMING_SNAKE_CASE (e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH).'
+    )
 
     return [
         Message(
@@ -162,8 +174,7 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 
 # RELATION TYPE RULES
 
-- If FACT_TYPES are provided and the relationship matches one of the types (considering the entity type signature), use that fact_type_name as the `relation_type`.
-- Otherwise, derive a `relation_type` from the relationship predicate in SCREAMING_SNAKE_CASE (e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH).
+{relation_type_rules}
 
 # DATETIME RULES
 

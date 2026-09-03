@@ -28,6 +28,7 @@ from graphiti_core.edges import (
     EpisodicEdge,
     create_entity_edge_embeddings,
 )
+from graphiti_core.errors import OntologyValidationError
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
@@ -123,6 +124,7 @@ async def extract_edges(
     group_id: str = '',
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
+    strict_ontology: bool = False,
 ) -> list[EntityEdge]:
     """Extract edges from one or more episodes.
 
@@ -195,6 +197,7 @@ async def extract_edges(
         ],
         'reference_time': latest_episode.valid_at,
         'edge_types': edge_types_context,
+        'strict_ontology': strict_ontology,
         'custom_extraction_instructions': (custom_extraction_instructions or '')
         + episode_attribution,
     }
@@ -216,6 +219,11 @@ async def extract_edges(
 
         # Validate LLM-returned names exist in the nodes list
         if source_name not in name_to_node:
+            if strict_ontology:
+                raise OntologyValidationError(
+                    f'Source entity "{source_name}" not found in nodes for edge relation: '
+                    f'{edge_data.relation_type}'
+                )
             logger.warning(
                 'Source entity not found in nodes for edge relation: %s',
                 edge_data.relation_type,
@@ -223,6 +231,11 @@ async def extract_edges(
             continue
 
         if target_name not in name_to_node:
+            if strict_ontology:
+                raise OntologyValidationError(
+                    f'Target entity "{target_name}" not found in nodes for edge relation: '
+                    f'{edge_data.relation_type}'
+                )
             logger.warning(
                 'Target entity not found in nodes for edge relation: %s',
                 edge_data.relation_type,
@@ -265,6 +278,11 @@ async def extract_edges(
         target_node = name_to_node.get(edge_data.target_entity_name)
 
         if source_node is None or target_node is None:
+            if strict_ontology:
+                raise OntologyValidationError(
+                    f'Could not find source or target node for edge relation: '
+                    f'{edge_data.relation_type}'
+                )
             logger.warning('Could not find source or target node for extracted edge')
             continue
 

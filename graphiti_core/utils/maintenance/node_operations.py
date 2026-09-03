@@ -51,6 +51,7 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
     _promote_resolved_node,
     _resolve_with_similarity,
 )
+from graphiti_core.utils.ontology_utils.strict_ontology import node_types_match
 from graphiti_core.utils.text_utils import (
     MAX_SUMMARY_CHARS,
     concatenate_episodes,
@@ -74,6 +75,7 @@ async def extract_nodes(
     entity_types: dict[str, type[BaseModel]] | None = None,
     excluded_entity_types: list[str] | None = None,
     custom_extraction_instructions: str | None = None,
+    strict_ontology: bool = False,
 ) -> tuple[list[EntityNode], dict[str, list[int]]]:
     """Extract entity nodes from one or more episodes.
 
@@ -142,7 +144,7 @@ async def extract_nodes(
         filtered_entities, entity_types_context, excluded_entity_types, episodes
     )
     extracted_nodes = _collapse_exact_duplicate_extracted_nodes(
-        extracted_nodes, node_episode_index_map
+        extracted_nodes, node_episode_index_map, strict_ontology
     )
 
     logger.debug(f'Extracted nodes: {[n.uuid for n in extracted_nodes]}')
@@ -336,6 +338,7 @@ def _create_entity_nodes(
 def _collapse_exact_duplicate_extracted_nodes(
     extracted_nodes: list[EntityNode],
     node_episode_index_map: dict[str, list[int]] | None = None,
+    strict_ontology: bool = False,
 ) -> list[EntityNode]:
     """Collapse same-message duplicates with the same normalized name.
 
@@ -349,15 +352,17 @@ def _collapse_exact_duplicate_extracted_nodes(
     if len(extracted_nodes) < 2:
         return extracted_nodes
 
-    canonical_by_name: dict[str, EntityNode] = {}
-    ordered_names: list[str] = []
+    canonical_by_key: dict[tuple[str, frozenset[str]], EntityNode] = {}
+    ordered_keys: list[tuple[str, frozenset[str]]] = []
 
     for node in extracted_nodes:
         normalized_name = _normalize_string_exact(node.name)
-        existing = canonical_by_name.get(normalized_name)
+        node_types = frozenset(label for label in node.labels if label != 'Entity')
+        key = (normalized_name, node_types if strict_ontology else frozenset())
+        existing = canonical_by_key.get(key)
         if existing is None:
-            canonical_by_name[normalized_name] = node
-            ordered_names.append(normalized_name)
+            canonical_by_key[key] = node
+            ordered_keys.append(key)
             continue
 
         existing_specific_labels = {label for label in existing.labels if label != 'Entity'}
@@ -367,7 +372,7 @@ def _collapse_exact_duplicate_extracted_nodes(
             and len(node.name.strip()) > len(existing.name.strip())
         ):
             old_canonical = existing
-            canonical_by_name[normalized_name] = node
+            canonical_by_key[key] = node
             # Merge episode indices: old canonical -> new canonical
             if node_episode_index_map is not None:
                 old_indices = node_episode_index_map.pop(old_canonical.uuid, [])
@@ -381,7 +386,7 @@ def _collapse_exact_duplicate_extracted_nodes(
                 set(canonical_indices + discarded_indices)
             )
 
-    return [canonical_by_name[name] for name in ordered_names]
+    return [canonical_by_key[key] for key in ordered_keys]
 
 
 def _merge_candidate_nodes(
@@ -408,9 +413,28 @@ async def _collect_candidate_nodes(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
     existing_nodes_override: list[EntityNode] | None,
+    strict_ontology: bool = False,
 ) -> list[list[EntityNode]]:
     """Search per extracted name and return ordered candidates for each extracted node."""
-    search_results = await _semantic_candidate_search(clients, extracted_nodes)
+    search_results = await _semantic_candidate_search(clients, extracted_nodes, strict_ontology)
+
+    if strict_ontology:
+        search_results = [
+            [candidate for candidate in candidates if node_types_match(node, candidate)]
+            for node, candidates in zip(extracted_nodes, search_results, strict=True)
+        ]
+        if existing_nodes_override is not None:
+            return [
+                _merge_candidate_nodes(
+                    candidates,
+                    [
+                        candidate
+                        for candidate in existing_nodes_override
+                        if node_types_match(node, candidate)
+                    ],
+                )
+                for node, candidates in zip(extracted_nodes, search_results, strict=True)
+            ]
 
     return [_merge_candidate_nodes(result, existing_nodes_override) for result in search_results]
 
@@ -418,6 +442,7 @@ async def _collect_candidate_nodes(
 async def _semantic_candidate_search(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
+    strict_ontology: bool = False,
 ) -> list[list[EntityNode]]:
     """Run direct cosine similarity search per extracted node without reranking."""
     if not extracted_nodes:
@@ -439,7 +464,13 @@ async def _semantic_candidate_search(
                 node_similarity_search(
                     clients.driver,
                     query_vector,
-                    SearchFilters(),
+                    SearchFilters(
+                        node_labels=(
+                            [label for label in node.labels if label != 'Entity'] or ['Entity']
+                        )
+                        if strict_ontology
+                        else None
+                    ),
                     [node.group_id],
                     NODE_DEDUP_CANDIDATE_LIMIT,
                     NODE_DEDUP_COSINE_MIN_SCORE,
@@ -472,6 +503,7 @@ async def _resolve_with_llm(
     episode: EpisodicNode | None,
     previous_episodes: list[EpisodicNode] | None,
     entity_types: dict[str, type[BaseModel]] | None,
+    strict_ontology: bool = False,
 ) -> None:
     """Escalate unresolved nodes to the dedupe prompt so the LLM can select or reject duplicates.
 
@@ -607,9 +639,16 @@ async def _resolve_with_llm(
         if duplicate_candidate_id < 0:
             resolved_node = extracted_node
         elif duplicate_candidate_id in candidates_by_id:
-            resolved_node = _promote_resolved_node(
-                extracted_node, candidates_by_id[duplicate_candidate_id]
-            )
+            candidate = candidates_by_id[duplicate_candidate_id]
+            if strict_ontology and not node_types_match(extracted_node, candidate):
+                logger.warning(
+                    'Ignoring cross-type LLM dedupe candidate %s for extracted node %s',
+                    candidate.uuid,
+                    extracted_node.uuid,
+                )
+                resolved_node = extracted_node
+            else:
+                resolved_node = _promote_resolved_node(extracted_node, candidate)
         else:
             logger.warning(
                 'Invalid duplicate_candidate_id %d for extracted node %s; treating as no duplicate.',
@@ -631,6 +670,7 @@ async def resolve_extracted_nodes(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, type[BaseModel]] | None = None,
     existing_nodes_override: list[EntityNode] | None = None,
+    strict_ontology: bool = False,
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
     """Resolve nodes with semantic retrieval first, then deterministic and LLM dedup."""
     llm_client = clients.llm_client
@@ -638,6 +678,7 @@ async def resolve_extracted_nodes(
         clients,
         extracted_nodes,
         existing_nodes_override,
+        strict_ontology,
     )
 
     state = DedupResolutionState(
@@ -686,6 +727,7 @@ async def resolve_extracted_nodes(
             episode,
             previous_episodes,
             entity_types,
+            strict_ontology,
         )
 
     if not state.unresolved_indices and not any(candidate_nodes_by_extracted):

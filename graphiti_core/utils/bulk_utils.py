@@ -60,6 +60,10 @@ from graphiti_core.utils.maintenance.node_operations import (
     extract_nodes,
     resolve_extracted_nodes,
 )
+from graphiti_core.utils.ontology_utils.strict_ontology import (
+    node_types_match,
+    validate_semantic_data_against_ontology,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +273,7 @@ async def extract_nodes_and_edges_bulk(
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
     use_combined_extraction: bool = False,
+    strict_ontology: bool = False,
 ) -> tuple[list[list[EntityNode]], list[list[EntityEdge]]]:
     if use_combined_extraction:
         return await _extract_nodes_and_edges_bulk_combined(
@@ -279,6 +284,7 @@ async def extract_nodes_and_edges_bulk(
             excluded_entity_types=excluded_entity_types,
             edge_types=edge_types,
             custom_extraction_instructions=custom_extraction_instructions,
+            strict_ontology=strict_ontology,
         )
 
     return await _extract_nodes_and_edges_bulk_separate(
@@ -289,6 +295,7 @@ async def extract_nodes_and_edges_bulk(
         excluded_entity_types=excluded_entity_types,
         edge_types=edge_types,
         custom_extraction_instructions=custom_extraction_instructions,
+        strict_ontology=strict_ontology,
     )
 
 
@@ -300,6 +307,7 @@ async def _extract_nodes_and_edges_bulk_combined(
     excluded_entity_types: list[str] | None = None,
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
+    strict_ontology: bool = False,
 ) -> tuple[list[list[EntityNode]], list[list[EntityEdge]]]:
     """Combined extraction: single LLM call per episode for both nodes and edges."""
     from graphiti_core.utils.maintenance.combined_extraction import (
@@ -317,6 +325,7 @@ async def _extract_nodes_and_edges_bulk_combined(
                 edge_type_map=edge_type_map,
                 edge_types=edge_types,
                 custom_extraction_instructions=custom_extraction_instructions,
+                strict_ontology=strict_ontology,
             )
             for episode, previous_episodes in episode_tuples
         ]
@@ -324,6 +333,11 @@ async def _extract_nodes_and_edges_bulk_combined(
 
     nodes_bulk = [nodes for nodes, _, _ in results]
     edges_bulk = [edges for _, edges, _ in results]
+    if strict_ontology:
+        for nodes, edges in zip(nodes_bulk, edges_bulk, strict=True):
+            validate_semantic_data_against_ontology(
+                nodes, edges, entity_types or {}, edge_types or {}, edge_type_map
+            )
     return nodes_bulk, edges_bulk
 
 
@@ -335,6 +349,7 @@ async def _extract_nodes_and_edges_bulk_separate(
     excluded_entity_types: list[str] | None = None,
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
+    strict_ontology: bool = False,
 ) -> tuple[list[list[EntityNode]], list[list[EntityEdge]]]:
     """Separate extraction: two sequential LLM calls per episode (legacy)."""
     extracted_results: list[tuple[list[EntityNode], dict[str, list[int]]]] = await semaphore_gather(
@@ -346,6 +361,7 @@ async def _extract_nodes_and_edges_bulk_separate(
                 entity_types=entity_types,
                 excluded_entity_types=excluded_entity_types,
                 custom_extraction_instructions=custom_extraction_instructions,
+                strict_ontology=strict_ontology,
             )
             for episode, previous_episodes in episode_tuples
         ]
@@ -363,10 +379,17 @@ async def _extract_nodes_and_edges_bulk_separate(
                 group_id=episode.group_id,
                 edge_types=edge_types,
                 custom_extraction_instructions=custom_extraction_instructions,
+                strict_ontology=strict_ontology,
             )
             for i, (episode, previous_episodes) in enumerate(episode_tuples)
         ]
     )
+
+    if strict_ontology:
+        for nodes, edges in zip(extracted_nodes_bulk, extracted_edges_bulk, strict=True):
+            validate_semantic_data_against_ontology(
+                nodes, edges, entity_types or {}, edge_types or {}, edge_type_map
+            )
 
     return extracted_nodes_bulk, extracted_edges_bulk
 
@@ -376,6 +399,7 @@ async def dedupe_nodes_bulk(
     extracted_nodes: list[list[EntityNode]],
     episode_tuples: list[tuple[EpisodicNode, list[EpisodicNode]]],
     entity_types: dict[str, type[BaseModel]] | None = None,
+    strict_ontology: bool = False,
 ) -> tuple[dict[str, list[EntityNode]], dict[str, str]]:
     """Resolve entity duplicates across an in-memory batch using a two-pass strategy.
 
@@ -394,6 +418,7 @@ async def dedupe_nodes_bulk(
                 episode_tuples[i][0],
                 episode_tuples[i][1],
                 entity_types,
+                strict_ontology=strict_ontology,
             )
             for i, nodes in enumerate(extracted_nodes)
         ]
@@ -423,6 +448,15 @@ async def dedupe_nodes_bulk(
                 continue
 
             existing_candidates = list(canonical_nodes.values())
+            if strict_ontology:
+                existing_candidates = [
+                    candidate
+                    for candidate in existing_candidates
+                    if node_types_match(node, candidate)
+                ]
+                if not existing_candidates:
+                    canonical_nodes[node.uuid] = node
+                    continue
             normalized = _normalize_string_exact(node.name)
             exact_match = next(
                 (

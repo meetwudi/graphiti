@@ -27,6 +27,7 @@ from graphiti_core.utils.maintenance.node_operations import (
     _collect_candidate_nodes,
     _extract_entity_summaries_batch,
     _resolve_with_llm,
+    _semantic_candidate_search,
     extract_attributes_from_nodes,
     resolve_extracted_nodes,
 )
@@ -114,6 +115,87 @@ async def test_resolve_nodes_exact_match_promotes_generic_candidate_type(monkeyp
     assert set(candidate.labels) == {'Entity', 'Person'}
     assert uuid_map[extracted.uuid] == candidate.uuid
     llm_generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_resolution_does_not_merge_same_name_nodes_of_different_types(monkeypatch):
+    clients, llm_generate = _make_clients()
+
+    company = EntityNode(name='Acme', group_id='group', labels=['Entity', 'Company'])
+    product = EntityNode(name='Acme', group_id='group', labels=['Entity', 'Product'])
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search',
+        _semantic_candidates([[company]]),
+    )
+
+    resolved, uuid_map, duplicates = await resolve_extracted_nodes(
+        clients,
+        [product],
+        episode=_make_episode(),
+        previous_episodes=[],
+        strict_ontology=True,
+    )
+
+    assert resolved == [product]
+    assert uuid_map[product.uuid] == product.uuid
+    assert duplicates == []
+    llm_generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_resolution_filters_candidate_search_by_extracted_type(monkeypatch):
+    clients, _ = _make_clients()
+    clients.embedder.create_batch = AsyncMock(return_value=[[0.1, 0.2]])
+    product = EntityNode(name='Acme', group_id='group', labels=['Entity', 'Product'])
+    captured_filters = []
+
+    async def fake_similarity_search(
+        _driver, _query_vector, search_filter, _group_ids, _limit, _min_score
+    ):
+        captured_filters.append(search_filter)
+        return []
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.node_similarity_search',
+        fake_similarity_search,
+    )
+
+    await _semantic_candidate_search(clients, [product], strict_ontology=True)
+
+    assert captured_filters[0].node_labels == ['Product']
+
+
+@pytest.mark.asyncio
+async def test_strict_resolution_rejects_cross_type_llm_candidate_from_pooled_batch(monkeypatch):
+    clients, llm_generate = _make_clients()
+    llm_generate.return_value = {
+        'entity_resolutions': [
+            {'id': 0, 'name': 'PX', 'duplicate_candidate_id': 1},
+            {'id': 1, 'name': 'CX', 'duplicate_candidate_id': -1},
+        ]
+    }
+    product_candidate = EntityNode(name='PY', group_id='group', labels=['Entity', 'Product'])
+    company_candidate = EntityNode(name='CY', group_id='group', labels=['Entity', 'Company'])
+    product = EntityNode(name='PX', group_id='group', labels=['Entity', 'Product'])
+    company = EntityNode(name='CX', group_id='group', labels=['Entity', 'Company'])
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search',
+        _semantic_candidates([[product_candidate], [company_candidate]]),
+    )
+
+    resolved, uuid_map, duplicates = await resolve_extracted_nodes(
+        clients,
+        [product, company],
+        episode=_make_episode(),
+        previous_episodes=[],
+        strict_ontology=True,
+    )
+
+    assert resolved == [product, company]
+    assert uuid_map[product.uuid] == product.uuid
+    assert uuid_map[company.uuid] == company.uuid
+    assert duplicates == []
+    llm_generate.assert_awaited_once()
 
 
 @pytest.mark.asyncio

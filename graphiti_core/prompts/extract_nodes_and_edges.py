@@ -73,18 +73,27 @@ class Versions(TypedDict):
     extract_message: PromptFunction
 
 
-def _build_edge_types_section(edge_types: list[dict] | None) -> str:
+def _build_edge_types_section(edge_types: list[dict] | None, strict_ontology: bool = False) -> str:
     """Build the optional FACT TYPES section for the combined prompt."""
     if not edge_types:
         return ''
+    relation_type_rules = (
+        '- FACT TYPES are exhaustive. Emit an edge only when a declared fact_type_name matches '
+        'the source and target entity type signature.\n'
+        '- If no declared FACT TYPE and signature match, omit the edge. Never invent a '
+        'relation_type.'
+        if strict_ontology
+        else '- When a relationship matches a FACT TYPE, use that fact_type_name as the '
+        'relation_type.\n'
+        '- If no FACT TYPE fits, derive a relation_type in SCREAMING_SNAKE_CASE '
+        '(e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH).'
+    )
     return f"""
 <FACT TYPES>
 {to_prompt_json(edge_types)}
 </FACT TYPES>
 RELATION TYPE RULES:
-- When a relationship matches a FACT TYPE, use that fact_type_name as the relation_type.
-- If no FACT TYPE fits, derive a relation_type in SCREAMING_SNAKE_CASE
-  (e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH).
+{relation_type_rules}
 """
 
 
@@ -289,7 +298,7 @@ G) Direct speaker-to-target edges (no fragmenting through scenery)
 <ENTITY TYPES>
 {context['entity_types']}
 </ENTITY TYPES>
-{_build_edge_types_section(context.get('edge_types'))}
+{_build_edge_types_section(context.get('edge_types'), context.get('strict_ontology', False))}
 <PREVIOUS MESSAGES>
 {to_prompt_json([ep for ep in context['previous_episodes']])}
 </PREVIOUS MESSAGES>
